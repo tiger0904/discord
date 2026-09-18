@@ -178,15 +178,115 @@ def parse_roster(text: str) -> tuple[list[RosterRow], list[str]]:
 
     return rows, errors
 
+@dataclass(slots=True)
+class MemberMatch:
+    member: discord.Member | None
+    status: str
+    detail: str = ""
+
+
+def _normalize_exact(value: str) -> str:
+    """NFKC + 空白正規化，但保留英文大小寫。"""
+    value = unicodedata.normalize("NFKC", value)
+    return " ".join(value.strip().split())
+
+
+def _build_member_indexes(
+    members: Iterable[discord.Member],
+) -> tuple[
+    dict[str, list[discord.Member]],
+    dict[str, list[discord.Member]],
+    dict[str, list[discord.Member]],
+    dict[str, list[discord.Member]],
+]:
+    """
+    四層索引：
+    1. display_name：NFKC、保留大小寫
+    2. username：NFKC、保留大小寫
+    3. display_name：NFKC + casefold
+    4. username：NFKC + casefold
+    """
+    display_exact: dict[str, list[discord.Member]] = {}
+    username_exact: dict[str, list[discord.Member]] = {}
+    display_folded: dict[str, list[discord.Member]] = {}
+    username_folded: dict[str, list[discord.Member]] = {}
+
+    for member in members:
+        d_exact = _normalize_exact(member.display_name)
+        u_exact = _normalize_exact(member.name)
+
+        display_exact.setdefault(d_exact, []).append(member)
+        username_exact.setdefault(u_exact, []).append(member)
+        display_folded.setdefault(d_exact.casefold(), []).append(member)
+        username_folded.setdefault(u_exact.casefold(), []).append(member)
+
+    return display_exact, username_exact, display_folded, username_folded
+
+
+def _unique_members(values: Iterable[discord.Member]) -> list[discord.Member]:
+    by_id: dict[int, discord.Member] = {}
+    for member in values:
+        by_id[member.id] = member
+    return list(by_id.values())
+
+
+def match_member(
+    query: str,
+    indexes: tuple[
+        dict[str, list[discord.Member]],
+        dict[str, list[discord.Member]],
+        dict[str, list[discord.Member]],
+        dict[str, list[discord.Member]],
+    ],
+) -> MemberMatch:
+    """
+    依優先順序比對：
+    1. display_name 完全一致（NFKC/空白正規化，大小寫保留）
+    2. username 完全一致
+    3. display_name 大小寫不敏感
+    4. username 大小寫不敏感
+
+    每一層若唯一命中就立即採用；同層命中多個不同 Discord ID 才視為衝突。
+    因此 Discord 顯示名稱 `chi` 與 `Chi` 可被分開。
+    """
+    display_exact, username_exact, display_folded, username_folded = indexes
+    exact = _normalize_exact(query)
+    folded = exact.casefold()
+
+    stages = (
+        ("顯示名稱", display_exact.get(exact, [])),
+        ("使用者名稱", username_exact.get(exact, [])),
+        ("顯示名稱（忽略大小寫）", display_folded.get(folded, [])),
+        ("使用者名稱（忽略大小寫）", username_folded.get(folded, [])),
+    )
+
+    for label, matches in stages:
+        unique = _unique_members(matches)
+        if len(unique) == 1:
+            return MemberMatch(unique[0], "ok", label)
+        if len(unique) > 1:
+            detail = "、".join(
+                f"{m.display_name} (@{m.name}, {m.id})" for m in unique[:5]
+            )
+            return MemberMatch(
+                None,
+                "duplicate",
+                f"{label}命中 {len(unique)} 位：{detail}",
+            )
+
+    return MemberMatch(None, "not_found", "")
+
+
 def member_name_index(members: Iterable[discord.Member]) -> dict[str, list[discord.Member]]:
+    """
+    保留舊 helper 供其他程式碼相容使用。
+    新的 /同步團員 使用 match_member() 多層比對。
+    """
     index: dict[str, list[discord.Member]] = {}
     for member in members:
-        # 需求核心：優先使用「伺服器暱稱 / display_name」。
-        # 如果沒有設伺服器暱稱，display_name 會回退到 global display name / username。
         key = normalize_name(member.display_name)
         index.setdefault(key, []).append(member)
     return index
-
 
 def find_role_exact(guild: discord.Guild, role_name: str) -> discord.Role | None:
     wanted = normalize_name(role_name)
@@ -351,7 +451,7 @@ class TeamRoleBot(commands.Bot):
     ) -> str:
         rows, malformed = parse_roster(roster_text)
         members = await load_all_members(guild)
-        index = member_name_index(members)
+        indexes = _build_member_indexes(members)
 
         successes: list[str] = []
         not_found: list[str] = []
@@ -360,20 +460,20 @@ class TeamRoleBot(commands.Bot):
         permission_errors: list[str] = []
 
         for row in rows:
-            key = normalize_name(row.discord_name)
-            matches = index.get(key, [])
+            match = match_member(row.discord_name, indexes)
 
-            if not matches:
+            if match.status == "not_found" or match.member is None and match.status != "duplicate":
                 not_found.append(f"{row.discord_name}（{row.game_id}）")
                 continue
 
-            if len(matches) > 1:
+            if match.status == "duplicate":
                 duplicates.append(
-                    f"{row.discord_name}：{len(matches)} 位同名成員"
+                    f"{row.discord_name}：{match.detail}"
                 )
                 continue
 
-            member = matches[0]
+            member = match.member
+            assert member is not None
             role = find_role_exact(guild, row.group_name)
 
             if role is None:
@@ -395,6 +495,15 @@ class TeamRoleBot(commands.Bot):
                 remember_role(guild.id, role)
                 successes.append(
                     f"{row.discord_name} → {row.group_name}"
+                )
+                log.info(
+                    "Roster match: %r -> %s (@%s, %s) via %s -> %s",
+                    row.discord_name,
+                    member.display_name,
+                    member.name,
+                    member.id,
+                    match.detail,
+                    row.group_name,
                 )
             except (discord.Forbidden, discord.HTTPException) as exc:
                 permission_errors.append(
@@ -437,9 +546,9 @@ class TeamRoleBot(commands.Bot):
 
         out = [
             "## 團員身分組同步完成",
-            f"✅ 成功：**{len(successes)}**",
-            f"🔎 找不到暱稱：**{len(not_found)}**",
-            f"👥 同名衝突：**{len(duplicates)}**",
+            f"✅ 成功關係：**{len(successes)}**",
+            f"🔎 找不到暱稱：**{len(not_found)} 筆 / {len(dict.fromkeys(not_found))} 個唯一項目**",
+            f"👥 同名衝突：**{len(duplicates)} 筆 / {len(dict.fromkeys(duplicates))} 個唯一項目**",
             f"🏷️ 找不到身分組：**{len(set(role_missing))}**",
             f"🧱 權限/排序錯誤：**{len(permission_errors)}**",
             f"📝 格式錯誤：**{len(malformed)}**",
