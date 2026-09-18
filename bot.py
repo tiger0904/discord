@@ -198,18 +198,16 @@ def _build_member_indexes(
     dict[str, list[discord.Member]],
     dict[str, list[discord.Member]],
     dict[str, list[discord.Member]],
+    dict[int, discord.Member],
 ]:
     """
-    四層索引：
-    1. display_name：NFKC、保留大小寫
-    2. username：NFKC、保留大小寫
-    3. display_name：NFKC + casefold
-    4. username：NFKC + casefold
+    五層索引：display name / username（精確與忽略大小寫）+ Discord ID。
     """
     display_exact: dict[str, list[discord.Member]] = {}
     username_exact: dict[str, list[discord.Member]] = {}
     display_folded: dict[str, list[discord.Member]] = {}
     username_folded: dict[str, list[discord.Member]] = {}
+    member_by_id: dict[int, discord.Member] = {}
 
     for member in members:
         d_exact = _normalize_exact(member.display_name)
@@ -219,8 +217,9 @@ def _build_member_indexes(
         username_exact.setdefault(u_exact, []).append(member)
         display_folded.setdefault(d_exact.casefold(), []).append(member)
         username_folded.setdefault(u_exact.casefold(), []).append(member)
+        member_by_id[member.id] = member
 
-    return display_exact, username_exact, display_folded, username_folded
+    return display_exact, username_exact, display_folded, username_folded, member_by_id
 
 
 def _unique_members(values: Iterable[discord.Member]) -> list[discord.Member]:
@@ -237,27 +236,45 @@ def match_member(
         dict[str, list[discord.Member]],
         dict[str, list[discord.Member]],
         dict[str, list[discord.Member]],
+        dict[int, discord.Member],
     ],
 ) -> MemberMatch:
     """
     依優先順序比對：
+    0. Discord ID（純數字或 <@ID>/<@!ID>）
     1. display_name 完全一致（NFKC/空白正規化，大小寫保留）
-    2. username 完全一致
+    2. username 完全一致（可寫 @username）
     3. display_name 大小寫不敏感
     4. username 大小寫不敏感
 
     每一層若唯一命中就立即採用；同層命中多個不同 Discord ID 才視為衝突。
     因此 Discord 顯示名稱 `chi` 與 `Chi` 可被分開。
     """
-    display_exact, username_exact, display_folded, username_folded = indexes
+    display_exact, username_exact, display_folded, username_folded, member_by_id = indexes
     exact = _normalize_exact(query)
+
+    # 支援 Discord mention：<@123> / <@!123>，以及直接貼 Discord ID。
+    id_text = exact
+    if id_text.startswith("<@") and id_text.endswith(">"):
+        id_text = id_text[2:-1]
+        if id_text.startswith("!"):
+            id_text = id_text[1:]
+    if id_text.isdigit():
+        member = member_by_id.get(int(id_text))
+        if member is not None:
+            return MemberMatch(member, "ok", "Discord ID")
+        return MemberMatch(None, "not_found", "Discord ID 不在目前伺服器成員中")
+
+    # @username 僅把開頭 @ 當作輸入語法；display name 仍可正常包含其他 @ 字元。
+    username_query = exact[1:] if exact.startswith("@") and len(exact) > 1 else exact
     folded = exact.casefold()
+    username_folded_query = username_query.casefold()
 
     stages = (
         ("顯示名稱", display_exact.get(exact, [])),
-        ("使用者名稱", username_exact.get(exact, [])),
+        ("使用者名稱", username_exact.get(username_query, [])),
         ("顯示名稱（忽略大小寫）", display_folded.get(folded, [])),
-        ("使用者名稱（忽略大小寫）", username_folded.get(folded, [])),
+        ("使用者名稱（忽略大小寫）", username_folded.get(username_folded_query, [])),
     )
 
     for label, matches in stages:
@@ -409,7 +426,7 @@ class TeamRoleBot(commands.Bot):
 
 
     async def on_ready(self) -> None:
-        log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")
+        log.info("Logged in as %s (%s) | TeamRoleBot v9", self.user, self.user.id if self.user else "?")
 
     async def clear_managed_roles(self, guild: discord.Guild) -> tuple[int, int, list[str]]:
         ids = managed_role_ids(guild.id)
