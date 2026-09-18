@@ -111,7 +111,7 @@ class RosterRow:
     raw: str
     group_name: str
     discord_name: str
-    game_id: str
+    game_id: str = ""
 
 
 def normalize_name(value: str) -> str:
@@ -125,25 +125,23 @@ def normalize_name(value: str) -> str:
 
 def parse_roster(text: str) -> tuple[list[RosterRow], list[str]]:
     """
-    新格式：
-
+    格式：
     丸子1團
-    DC名稱
     DC名稱
     DC名稱
 
     丸子2團
     DC名稱
-    DC名稱
 
-    規則：
-    - 單獨一行、名稱符合「丸子...團」時，視為接下來成員的目標 Role。
-    - 後續每一個非空白行都視為 Discord 伺服器顯示名稱。
-    - 遇到下一個團名後切換目標 Role。
+    同一 Discord 使用者可出現在不同團；(團別, DC名稱) 才是唯一關係。
+    同一人在同一團重複出現時會自動去重。
     """
     rows: list[RosterRow] = []
     errors: list[str] = []
     current_role: str | None = None
+    seen_pairs: set[tuple[str, str]] = set()
+
+    prefixes = tuple(normalize_name(x) for x in TEAM_ROLE_PREFIXES)
 
     for line_no, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -152,8 +150,7 @@ def parse_roster(text: str) -> tuple[list[RosterRow], list[str]]:
 
         normalized = normalize_name(line)
 
-        # 團名標題：預設支援「丸子1團」「丸子2團」「丸子3團」等。
-        if normalized.startswith(normalize_name("丸子")) and normalized.endswith(normalize_name("團")):
+        if prefixes and any(normalized.startswith(p) for p in prefixes) and normalized.endswith(normalize_name("團")):
             current_role = line
             continue
 
@@ -161,46 +158,25 @@ def parse_roster(text: str) -> tuple[list[RosterRow], list[str]]:
             errors.append(f"第 {line_no} 行 `{line}` 前面沒有團名，例如 `丸子1團`。")
             continue
 
-        # RosterRow 原本包含 role_name / discord_display_name / game_id 等欄位。
-        # 新格式沒有遊戲 ID，其餘欄位留空。
-        try:
-            rows.append(
-                RosterRow(
-                    role_name=current_role,
-                    discord_display_name=line,
-                    game_id="",
-                    raw_line=line,
-                )
+        # 排團資料中沒有 Discord 名稱的項目不做匹配。
+        if normalized in {normalize_name("未提供"), normalize_name("空缺"), normalize_name("空缺職業")}:
+            continue
+
+        pair = (normalize_name(current_role), normalized)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+
+        rows.append(
+            RosterRow(
+                raw=line,
+                group_name=current_role,
+                discord_name=line,
+                game_id="",
             )
-        except TypeError:
-            # 相容舊 dataclass 欄位順序/額外欄位。
-            try:
-                rows.append(
-                    RosterRow(
-                        group_name=current_role,
-                        discord_name=line,
-                        game_id="",
-                        raw=line,
-                    )
-                )
-            except TypeError:
-                # 依既有 dataclass 欄位自動填入。
-                import dataclasses
-                values = {}
-                for f in dataclasses.fields(RosterRow):
-                    name = f.name
-                    if name in ("role_name", "group_name", "team_name"):
-                        values[name] = current_role
-                    elif name in ("discord_display_name", "discord_name", "display_name"):
-                        values[name] = line
-                    elif name in ("game_id", "raw_line", "raw"):
-                        values[name] = "" if name == "game_id" else line
-                    elif f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
-                        values[name] = ""
-                rows.append(RosterRow(**values))
+        )
 
     return rows, errors
-
 
 def member_name_index(members: Iterable[discord.Member]) -> dict[str, list[discord.Member]]:
     index: dict[str, list[discord.Member]] = {}
@@ -220,16 +196,31 @@ def find_role_exact(guild: discord.Guild, role_name: str) -> discord.Role | None
     return None
 
 
-async def load_all_members(guild: discord.Guild) -> list[discord.Member]:
+async def load_all_members(
+    guild: discord.Guild,
+    timeout_seconds: float = 10.0,
+) -> list[discord.Member]:
     """
-    盡量取得完整伺服器成員清單。
+    盡量取得完整伺服器成員清單，但 guild.chunk() 最多等待 10 秒。
     需要 Developer Portal 開啟 SERVER MEMBERS INTENT。
+    逾時或 Gateway/API 失敗時，改用目前 member cache，避免 slash command 永久卡住。
     """
     try:
-        # chunk() 會向 Discord Gateway 要求完整 member cache。
-        await guild.chunk(cache=True)
+        await asyncio.wait_for(
+            guild.chunk(cache=True),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "guild.chunk timed out for %s after %.1fs; using cached members (%d)",
+            guild.id,
+            timeout_seconds,
+            len(guild.members),
+        )
     except (discord.HTTPException, discord.ClientException) as exc:
         log.warning("guild.chunk failed for %s: %s", guild.id, exc)
+    except Exception:
+        log.exception("Unexpected guild.chunk failure for %s", guild.id)
 
     return list(guild.members)
 
@@ -627,18 +618,22 @@ async def sync_existing_team_roles(interaction: discord.Interaction) -> None:
         )
         return
 
-    role_member_counts = {}
+    candidate_role_ids = {role.id for role in candidate_roles}
+    role_member_counts = {role.id: 0 for role in candidate_roles}
     member_role_pairs = 0
     members_with_team_role = set()
 
-    for role in candidate_roles:
-        count = 0
-        for member in members:
-            if role in member.roles:
-                count += 1
-                member_role_pairs += 1
-                members_with_team_role.add(member.id)
-        role_member_counts[role.id] = count
+    # 單次掃描 member.roles，避免「Role 數 × 成員數」的巢狀掃描。
+    for member in members:
+        member_has_team_role = False
+        for role in member.roles:
+            if role.id not in candidate_role_ids:
+                continue
+            role_member_counts[role.id] += 1
+            member_role_pairs += 1
+            member_has_team_role = True
+        if member_has_team_role:
+            members_with_team_role.add(member.id)
 
     # 匯入 managed_roles，讓之後清除功能能管理「Bot 以前沒記到」的團隊 Role。
     # 直接沿用 remember_role()，確保 created_at 等欄位完整。
